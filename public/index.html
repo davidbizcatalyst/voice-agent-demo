@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Agent Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .voice-controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        .talk-button {
+            padding: 15px 30px;
+            font-size: 18px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin: 10px;
+        }
+        .talk-button.listening {
+            background-color: #ff4444;
+            color: white;
+            animation: pulse 1s infinite;
+        }
+        .talk-button.idle {
+            background-color: #4CAF50;
+            color: white;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+        .status {
+            text-align: center;
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .transcript {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+            min-height: 100px;
+        }
+        .transcript h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .user-speech {
+            color: #0066cc;
+            font-style: italic;
+        }
+        .agent-response {
+            color: #cc6600;
+            font-weight: bold;
+        }
+        .interim {
+            opacity: 0.7;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ Voice Agent Demo</h1>
+        
+        <div id="status" class="status disconnected">
+            Disconnected
+        </div>
+        
+        <div class="voice-controls">
+            <button id="talkButton" class="talk-button idle" disabled>
+                🎤 Click to Talk
+            </button>
+            <p>Hold down the button while speaking</p>
+        </div>
+        
+        <div class="transcript">
+            <h3>Conversation:</h3>
+            <div id="conversation"></div>
+        </div>
+    </div>
+
+    <script>
+        class VoiceAgent {
+            constructor() {
+                this.ws = null;
+                this.mediaRecorder = null;
+                this.isRecording = false;
+                this.audioContext = null;
+                this.audioChunks = [];
+                
+                this.talkButton = document.getElementById('talkButton');
+                this.statusElement = document.getElementById('status');
+                this.conversationElement = document.getElementById('conversation');
+                
+                this.initializeWebSocket();
+                this.initializeAudio();
+                this.setupEventListeners();
+            }
+            
+            initializeWebSocket() {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                this.ws = new WebSocket(`${protocol}//${window.location.host}`);
+                
+                this.ws.onopen = () => {
+                    this.updateStatus('Connected', true);
+                    this.talkButton.disabled = false;
+                };
+                
+                this.ws.onclose = () => {
+                    this.updateStatus('Disconnected', false);
+                    this.talkButton.disabled = true;
+                };
+                
+                this.ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    this.handleWebSocketMessage(data);
+                };
+                
+                this.ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                };
+            }
+            
+            async initializeAudio() {
+                try {
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    const stream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: {
+                            sampleRate: 48000,
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        } 
+                    });
+                    
+                    this.mediaRecorder = new MediaRecorder(stream, {
+                        mimeType: 'audio/webm;codecs=opus'
+                    });
+                    
+                    this.mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0) {
+                            this.sendAudioData(event.data);
+                        }
+                    };
+                    
+                } catch (error) {
+                    console.error('Error accessing microphone:', error);
+                    this.addToConversation('Error: Could not access microphone. Please check permissions.', 'error');
+                }
+            }
+            
+            setupEventListeners() {
+                // Mouse events
+                this.talkButton.addEventListener('mousedown', () => this.startRecording());
+                this.talkButton.addEventListener('mouseup', () => this.stopRecording());
+                this.talkButton.addEventListener('mouseleave', () => this.stopRecording());
+                
+                // Touch events for mobile
+                this.talkButton.addEventListener('touchstart', (e) => {
+                    e.preventDefault();
+                    this.startRecording();
+                });
+                this.talkButton.addEventListener('touchend', (e) => {
+                    e.preventDefault();
+                    this.stopRecording();
+                });
+            }
+            
+            startRecording() {
+                if (!this.mediaRecorder || this.isRecording) return;
+                
+                this.isRecording = true;
+                this.talkButton.textContent = '🔴 Recording... (Release to stop)';
+                this.talkButton.className = 'talk-button listening';
+                
+                this.audioChunks = [];
+                this.mediaRecorder.start(100); // Send data every 100ms
+                
+                this.ws.send(JSON.stringify({ type: 'start' }));
+            }
+            
+            stopRecording() {
+                if (!this.isRecording) return;
+                
+                this.isRecording = false;
+                this.talkButton.textContent = '🎤 Click to Talk';
+                this.talkButton.className = 'talk-button idle';
+                
+                this.mediaRecorder.stop();
+                this.ws.send(JSON.stringify({ type: 'stop' }));
+            }
+            
+            sendAudioData(audioBlob) {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const audioData = reader.result.split(',')[1]; // Remove data:audio/webm;base64,
+                    this.ws.send(JSON.stringify({
+                        type: 'audio',
+                        audio: audioData
+                    }));
+                };
+                reader.readAsDataURL(audioBlob);
+            }
+            
+            handleWebSocketMessage(data) {
+                switch (data.type) {
+                    case 'transcript':
+                        this.updateTranscript(data.text, data.isFinal);
+                        break;
+                    case 'audio_response':
+                        this.playAudioResponse(data.audio);
+                        this.addToConversation(data.text, 'agent');
+                        break;
+                }
+            }
+            
+            updateTranscript(text, isFinal) {
+                const className = isFinal ? 'user-speech' : 'user-speech interim';
+                
+                // Remove previous interim results
+                const interimElements = this.conversationElement.querySelectorAll('.interim');
+                interimElements.forEach(el => el.remove());
+                
+                if (isFinal) {
+                    this.addToConversation(`You: ${text}`, 'user');
+                } else {
+                    const interimDiv = document.createElement('div');
+                    interimDiv.className = className;
+                    interimDiv.textContent = `You: ${text}`;
+                    this.conversationElement.appendChild(interimDiv);
+                    this.conversationElement.scrollTop = this.conversationElement.scrollHeight;
+                }
+            }
+            
+            addToConversation(text, type) {
+                const div = document.createElement('div');
+                div.className = type === 'agent' ? 'agent-response' : 'user-speech';
+                div.textContent = text;
+                this.conversationElement.appendChild(div);
+                this.conversationElement.scrollTop = this.conversationElement.scrollHeight;
+            }
+            
+            playAudioResponse(audioBase64) {
+                const audio = new Audio(`data:audio/mp3;base64,${audioBase64}`);
+                audio.play().catch(error => {
+                    console.error('Error playing audio:', error);
+                });
+            }
+            
+            updateStatus(message, isConnected) {
+                this.statusElement.textContent = message;
+                this.statusElement.className = `status ${isConnected ? 'connected' : 'disconnected'}`;
+            }
+        }
+        
+        // Initialize the voice agent when the page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            new VoiceAgent();
+        });
+    </script>
+</body>
+</html>
