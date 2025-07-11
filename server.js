@@ -1,3 +1,16 @@
+//require('dotenv').config();
+
+//const express = require('express');
+//const WebSocket = require('ws');
+//const speech = require('@google-cloud/speech');
+//const textToSpeechClient = require('@google-cloud/text-to-speech');
+//const axios = require('axios');
+//const jsforce = require('jsforce');
+
+// Initialize Google Cloud clients
+//const speechClient = new speech.SpeechClient();
+//const ttsClient = new textToSpeechClient.TextToSpeechClient();
+
 require('dotenv').config();
 
 const express = require('express');
@@ -7,9 +20,19 @@ const textToSpeechClient = require('@google-cloud/text-to-speech');
 const axios = require('axios');
 const jsforce = require('jsforce');
 
-// Initialize Google Cloud clients
-const speechClient = new speech.SpeechClient();
-const ttsClient = new textToSpeechClient.TextToSpeechClient();
+// Initialize Google Cloud clients with cloud-friendly credential handling
+let speechClient, ttsClient;
+
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+    // Cloud environment - credentials from environment variable
+    const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+    speechClient = new speech.SpeechClient({ credentials });
+    ttsClient = new textToSpeechClient.TextToSpeechClient({ credentials });
+} else {
+    // Local environment - use default credential discovery
+    speechClient = new speech.SpeechClient();
+    ttsClient = new textToSpeechClient.TextToSpeechClient();
+}
 
 // Logging configuration
 const LOG_LEVEL = process.env.LOG_LEVEL || 'verbose'; // 'verbose' or 'terse'
