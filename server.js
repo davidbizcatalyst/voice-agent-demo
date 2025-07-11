@@ -1,16 +1,3 @@
-//require('dotenv').config();
-
-//const express = require('express');
-//const WebSocket = require('ws');
-//const speech = require('@google-cloud/speech');
-//const textToSpeechClient = require('@google-cloud/text-to-speech');
-//const axios = require('axios');
-//const jsforce = require('jsforce');
-
-// Initialize Google Cloud clients
-//const speechClient = new speech.SpeechClient();
-//const ttsClient = new textToSpeechClient.TextToSpeechClient();
-
 require('dotenv').config();
 
 const express = require('express');
@@ -62,9 +49,10 @@ const SALESFORCE_CONFIG = {
     agentId: process.env.SALESFORCE_AGENT_ID,
 };
 
-// Global variables for Salesforce connection
-let salesforceConnection = null;
+// Global variables for Salesforce connection with improved management
 let accessToken = null;
+let tokenExpiresAt = null;
+let isRefreshingToken = false;
 
 const app = express();
 const server = require('http').createServer(app);
@@ -72,22 +60,59 @@ const server = require('http').createServer(app);
 // Serve static files for the web interface
 app.use(express.static('public'));
 
+// Add health check endpoint for Railway
+app.get('/health', (req, res) => {
+    res.status(200).json({ 
+        status: 'healthy', 
+        timestamp: new Date().toISOString(),
+        salesforceConnected: !!accessToken,
+        tokenExpiry: tokenExpiresAt ? new Date(tokenExpiresAt).toISOString() : null
+    });
+});
+
+// Keep service awake with periodic health checks
+if (process.env.RAILWAY_ENVIRONMENT) {
+    const keepAliveInterval = setInterval(async () => {
+        try {
+            // Ping ourselves to prevent Railway from sleeping
+            const response = await fetch(`https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health`);
+            logVerbose('🏓 Keep-alive ping successful');
+        } catch (error) {
+            logVerbose('🏓 Keep-alive ping failed:', error.message);
+        }
+    }, 25 * 60 * 1000); // Every 25 minutes
+}
+
 // Generate unique session IDs
 function generateSessionId() {
     return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 }
 
-// Initialize Salesforce connection using Client Credentials flow
-async function initializeSalesforce() {
+// Improved Salesforce connection with token refresh
+async function ensureValidSalesforceToken() {
+    // Check if token is still valid (with 5 minute buffer)
+    if (accessToken && tokenExpiresAt && Date.now() < (tokenExpiresAt - 5 * 60 * 1000)) {
+        return accessToken;
+    }
+    
+    // Prevent multiple simultaneous refresh attempts
+    if (isRefreshingToken) {
+        logVerbose('🔄 Token refresh already in progress, waiting...');
+        // Wait for the ongoing refresh to complete
+        while (isRefreshingToken) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        return accessToken;
+    }
+    
+    isRefreshingToken = true;
+    
     try {
-        logTerse('🔄 Initializing Salesforce connection...');
+        logTerse('🔄 Refreshing Salesforce token...');
         
         if (!SALESFORCE_CONFIG.clientId || !SALESFORCE_CONFIG.clientSecret) {
-            logError('❌ Missing Salesforce credentials in .env file');
-            return false;
+            throw new Error('Missing Salesforce credentials in environment variables');
         }
-        
-        logVerbose('Using Client Credentials Flow for Agent API...');
         
         const tokenUrl = `${SALESFORCE_CONFIG.instanceUrl}/services/oauth2/token`;
         const tokenResponse = await axios.post(tokenUrl, null, {
@@ -99,39 +124,62 @@ async function initializeSalesforce() {
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
             },
+            timeout: 30000
         });
         
         accessToken = tokenResponse.data.access_token;
-        logTerse('✅ Salesforce authentication successful!');
-        logVerbose('Instance URL:', SALESFORCE_CONFIG.instanceUrl);
-        logVerbose('Agent ID:', SALESFORCE_CONFIG.agentId);
+        // Salesforce tokens typically last 2 hours, but we'll be conservative
+        tokenExpiresAt = Date.now() + (90 * 60 * 1000); // 90 minutes from now
         
-        return true;
+        logTerse('✅ Salesforce token refreshed successfully');
+        return accessToken;
         
     } catch (error) {
-        logError('❌ Salesforce connection failed:', error.message);
-        logTerse('Running in demo mode. Check your .env file configuration.');
+        logError('❌ Salesforce token refresh failed:', error.message);
+        accessToken = null;
+        tokenExpiresAt = null;
+        throw error;
+    } finally {
+        isRefreshingToken = false;
+    }
+}
+
+// Initialize Salesforce connection on startup
+async function initializeSalesforce() {
+    try {
+        logTerse('🔄 Initializing Salesforce connection...');
+        await ensureValidSalesforceToken();
+        logTerse('✅ Salesforce initialization successful!');
+        return true;
+    } catch (error) {
+        logError('❌ Salesforce initialization failed:', error.message);
+        logTerse('Running in demo mode. Check your environment variables.');
         return false;
     }
 }
 
 // Convert text to speech (British English)
 async function textToSpeech(text) {
-    const request = {
-        input: { text: text },
-        voice: {
-            languageCode: 'en-GB',
-            ssmlGender: 'FEMALE',
-        },
-        audioConfig: {
-            audioEncoding: 'MP3',
-            speakingRate: 1.0,
-            pitch: 0.0,
-        },
-    };
-    
-    const [response] = await ttsClient.synthesizeSpeech(request);
-    return response.audioContent;
+    try {
+        const request = {
+            input: { text: text },
+            voice: {
+                languageCode: 'en-GB',
+                ssmlGender: 'FEMALE',
+            },
+            audioConfig: {
+                audioEncoding: 'MP3',
+                speakingRate: 1.0,
+                pitch: 0.0,
+            },
+        };
+        
+        const [response] = await ttsClient.synthesizeSpeech(request);
+        return response.audioContent;
+    } catch (error) {
+        logError('❌ Text-to-speech error:', error.message);
+        throw error;
+    }
 }
 
 // Initialize Salesforce on startup
@@ -140,8 +188,13 @@ initializeSalesforce();
 // WebSocket server for real-time voice communication
 const wss = new WebSocket.Server({ server });
 
+// Track active connections for debugging
+let activeConnections = 0;
+
 wss.on('connection', (ws) => {
-    logTerse('🔗 New client connected');
+    activeConnections++;
+    const connectionId = generateSessionId();
+    logTerse(`🔗 New client connected (ID: ${connectionId.slice(-8)}, Total: ${activeConnections})`);
     
     let recognizeStream = null;
     let isStreamActive = false;
@@ -222,7 +275,8 @@ wss.on('connection', (ws) => {
     });
     
     ws.on('close', async () => {
-        logTerse('🔌 Client disconnected');
+        activeConnections--;
+        logTerse(`🔌 Client disconnected (ID: ${connectionId.slice(-8)}, Total: ${activeConnections})`);
         if (recognizeStream && !recognizeStream.destroyed) {
             isStreamActive = false;
             recognizeStream.end();
@@ -244,7 +298,10 @@ wss.on('connection', (ws) => {
         try {
             logVerbose('🔄 Creating new agent session...');
             
-            if (!accessToken || !SALESFORCE_CONFIG.agentId) {
+            // Ensure we have a valid token
+            const token = await ensureValidSalesforceToken();
+            
+            if (!token || !SALESFORCE_CONFIG.agentId) {
                 throw new Error('Missing Salesforce credentials or agent ID');
             }
             
@@ -264,7 +321,7 @@ wss.on('connection', (ws) => {
                 bypassUser: true
             }, {
                 headers: {
-                    'Authorization': `Bearer ${accessToken}`,
+                    'Authorization': `Bearer ${token}`,
                     'Content-Type': 'application/json',
                 },
                 timeout: 30000
@@ -311,12 +368,13 @@ wss.on('connection', (ws) => {
         if (!agentSessionId) return;
         
         try {
+            const token = await ensureValidSalesforceToken();
             const apiBaseURL = 'https://api.salesforce.com/einstein/ai-agent/v1';
             const endURL = `${apiBaseURL}/sessions/${agentSessionId}`;
             
             await axios.delete(endURL, {
                 headers: {
-                    'Authorization': `Bearer ${accessToken}`,
+                    'Authorization': `Bearer ${token}`,
                 },
                 timeout: 10000
             });
@@ -438,23 +496,36 @@ wss.on('connection', (ws) => {
             logError('❌ Error in processUserInput:', error);
             
             const fallbackResponse = "I'm sorry, I'm having trouble right now. Could you try again?";
-            const audioBuffer = await textToSpeech(fallbackResponse);
             
-            ws.send(JSON.stringify({
-                type: 'audio_response',
-                audio: audioBuffer.toString('base64'),
-                text: fallbackResponse
-            }));
+            try {
+                const audioBuffer = await textToSpeech(fallbackResponse);
+                ws.send(JSON.stringify({
+                    type: 'audio_response',
+                    audio: audioBuffer.toString('base64'),
+                    text: fallbackResponse
+                }));
+            } catch (ttsError) {
+                logError('❌ TTS fallback also failed:', ttsError);
+                // Send text-only response if TTS fails
+                ws.send(JSON.stringify({
+                    type: 'audio_response',
+                    audio: '',
+                    text: fallbackResponse
+                }));
+            }
         }
     }
     
-    // Modified callAgentforce to use persistent session
+    // Modified callAgentforce to use persistent session with better error handling
     async function callAgentforce(userMessage) {
-        if (!accessToken || !SALESFORCE_CONFIG.agentId) {
-            return `I heard you say: "${userMessage}". The voice interface is working perfectly, but Salesforce integration needs to be configured.`;
-        }
-        
         try {
+            // Ensure we have a valid token
+            const token = await ensureValidSalesforceToken();
+            
+            if (!token || !SALESFORCE_CONFIG.agentId) {
+                return `I heard you say: "${userMessage}". The voice interface is working perfectly, but Salesforce integration needs to be configured.`;
+            }
+            
             // Ensure we have a session
             if (!agentSessionId) {
                 await createAgentSession();
@@ -472,7 +543,7 @@ wss.on('connection', (ws) => {
             
             const messageResponse = await axios.post(messagesURL, messagePayload, {
                 headers: {
-                    'Authorization': `Bearer ${accessToken}`,
+                    'Authorization': `Bearer ${token}`,
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
                 },
@@ -494,19 +565,30 @@ wss.on('connection', (ws) => {
             logError('❌ Agentforce error:', error.response?.status, error.response?.statusText);
             
             if (error.response?.status === 401) {
-                // Try to reconnect
-                const reconnected = await initializeSalesforce();
-                if (reconnected) {
-                    return await callAgentforce(userMessage);
+                // Token expired, force refresh and retry once
+                logTerse('🔄 Token expired, refreshing...');
+                accessToken = null;
+                tokenExpiresAt = null;
+                
+                try {
+                    await ensureValidSalesforceToken();
+                    return await callAgentforce(userMessage); // Retry once with new token
+                } catch (retryError) {
+                    logError('❌ Token refresh and retry failed:', retryError.message);
                 }
             } else if (error.response?.status === 404 && agentSessionId) {
                 // Session might have expired, create a new one
-                logVerbose('🔄 Session expired, creating new session...');
+                logTerse('🔄 Session expired, creating new session...');
                 await resetAgentSession();
-                return await callAgentforce(userMessage);
+                try {
+                    return await callAgentforce(userMessage); // Retry with new session
+                } catch (sessionRetryError) {
+                    logError('❌ Session recreation and retry failed:', sessionRetryError.message);
+                }
             }
             
-            return "I'm having trouble connecting to the agent right now. Please try again.";
+            // If all retries fail
+            throw error;
         }
     }
 });
@@ -518,5 +600,6 @@ server.listen(PORT, () => {
     if (LOG_LEVEL === 'verbose') {
         logTerse('Make sure Google Cloud credentials are configured!');
     }
-    logTerse('🌐 Open http://localhost:3000 to use the voice interface');
+    logTerse('🌐 Ready for voice interactions');
 });
+// Just confirming this is new.
